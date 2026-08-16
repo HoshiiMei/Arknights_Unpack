@@ -14,7 +14,12 @@ public sealed record UnityFsHeader(
 	int HeaderSize,
 	int DataStart);
 
-public sealed record UnityFsEntry(string Path, long Offset, long Size, uint Flags);
+public sealed record UnityFsEntry(string Path, long Offset, long Size, uint Flags)
+{
+    public bool IsSerializedFile =>
+        !Path.EndsWith(".resS", StringComparison.OrdinalIgnoreCase)
+        && !Path.EndsWith(".resource", StringComparison.OrdinalIgnoreCase);
+}
 
 public sealed class UnityFsReader : IDisposable
 {
@@ -65,13 +70,18 @@ public sealed class UnityFsReader : IDisposable
 		}
 
 		UnityFsEntry entry = entries[index];
-		return new SliceStream(new BlockVirtualStream(stream, blocks, Header.DataStart), entry.Offset, entry.Size);
+		return new SliceStream(new BlockVirtualStream(stream, blocks, Header.DataStart), entry.Offset, entry.Size, leaveOpen: false);
 	}
 
 	public Stream OpenAllData()
 	{
 		ObjectDisposedException.ThrowIf(disposed, this);
 		return new BlockVirtualStream(stream, blocks, Header.DataStart);
+	}
+
+	internal static Stream CreateReadOnlySlice(Stream parent, long origin, long length, bool leaveOpen = true)
+	{
+		return new SliceStream(parent, origin, length, leaveOpen);
 	}
 
 	public void WriteUncompressedTo(Stream output)
@@ -609,15 +619,17 @@ public sealed class UnityFsReader : IDisposable
 		}
 	}
 
-	private sealed class SliceStream : Stream
+	internal sealed class SliceStream : Stream
 	{
 		private readonly Stream parent;
 		private readonly long origin;
 		private readonly long length;
+		private readonly bool leaveOpen;
 		private long position;
 
-		public SliceStream(Stream parent, long origin, long length)
+		internal SliceStream(Stream parent, long origin, long length, bool leaveOpen)
 		{
+			this.leaveOpen = leaveOpen;
 			ArgumentNullException.ThrowIfNull(parent);
 			if (origin < 0 || length < 0 || origin + length > parent.Length)
 			{
@@ -693,7 +705,7 @@ public sealed class UnityFsReader : IDisposable
 
 		protected override void Dispose(bool disposing)
 		{
-			if (disposing)
+			if (disposing && !leaveOpen)
 			{
 				parent.Dispose();
 			}
@@ -786,4 +798,6 @@ public sealed class UnityFsReader : IDisposable
 		}
 	}
 }
+
+
 
