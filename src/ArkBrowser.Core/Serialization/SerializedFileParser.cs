@@ -18,11 +18,40 @@ public sealed class SerializedFileHeaderInfo
 
 public sealed class SerializedTypeInfo
 {
+    public TypeTreeInfo? TypeTree { get; init; }
     public int TypeId { get; init; }
     public bool IsStripped { get; init; }
     public short ScriptTypeIndex { get; init; }
     public byte[]? ScriptId { get; init; }
     public byte[] OldTypeHash { get; init; } = [];
+}
+
+public sealed class TypeTreeInfo
+{
+    public IReadOnlyList<TypeTreeNode> Nodes { get; init; } = [];
+    public IReadOnlyDictionary<uint, string> CustomStrings { get; init; } = new Dictionary<uint, string>();
+
+    public bool TryGetString(uint offset, out string value)
+    {
+        return CustomStrings.TryGetValue(offset, out value!);
+    }
+}
+
+public sealed class TypeTreeNode
+{
+    public int Version { get; init; }
+    public byte Level { get; init; }
+    public byte TypeFlags { get; init; }
+    public uint TypeStrOffset { get; init; }
+    public uint NameStrOffset { get; init; }
+    public int ByteSize { get; init; }
+    public int Index { get; init; }
+    public uint MetaFlag { get; init; }
+    public ulong RefTypeHash { get; init; }
+    public string TypeName { get; init; } = string.Empty;
+    public string Name { get; init; } = string.Empty;
+    public bool HasBuiltInTypeName { get; init; }
+    public bool HasBuiltInName { get; init; }
 }
 
 public sealed class SerializedObjectInfo
@@ -150,23 +179,10 @@ public static class SerializedFileParser
             byte[]? scriptId = readScriptId ? reader.ReadBytes(Hash128Size).ToArray() : null;
             byte[] oldTypeHash = reader.ReadBytes(Hash128Size).ToArray();
 
+            TypeTreeInfo? typeTree = null;
             if (enableTypeTree)
             {
-                int nodeCount = reader.ReadInt32LittleEndian();
-                int stringBufferSize = reader.ReadInt32LittleEndian();
-                if (nodeCount < 0 || stringBufferSize < 0)
-                {
-                    throw new InvalidDataException("Type tree node count or string buffer size cannot be negative.");
-                }
-
-                long nodeBytes = (long)nodeCount * TypeTreeNodeSize;
-                if (nodeBytes > int.MaxValue)
-                {
-                    throw new InvalidDataException("Type tree is too large.");
-                }
-
-                reader.Skip((int)nodeBytes);
-                reader.Skip(stringBufferSize);
+                typeTree = ReadTypeTree(ref reader);
 
                 int typeDependencyCount = reader.ReadInt32LittleEndian();
                 if (typeDependencyCount < 0)
@@ -184,6 +200,7 @@ public static class SerializedFileParser
                 ScriptTypeIndex = scriptTypeIndex,
                 ScriptId = scriptId,
                 OldTypeHash = oldTypeHash,
+                TypeTree = typeTree,
             };
         }
 
@@ -243,6 +260,106 @@ public static class SerializedFileParser
             Types = types,
             Objects = objects,
         };
+    }
+
+    private static TypeTreeInfo ReadTypeTree(ref SpanReader reader)
+    {
+        int nodeCount = reader.ReadInt32LittleEndian();
+        int stringBufferSize = reader.ReadInt32LittleEndian();
+        if (nodeCount < 0 || stringBufferSize < 0)
+        {
+            throw new InvalidDataException("Type tree node count or string buffer size cannot be negative.");
+        }
+
+        long nodeBytes = (long)nodeCount * TypeTreeNodeSize;
+        if (nodeBytes > int.MaxValue)
+        {
+            throw new InvalidDataException("Type tree is too large.");
+        }
+
+        TypeTreeNode[] nodes = new TypeTreeNode[nodeCount];
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            int version = reader.ReadUInt16LittleEndian();
+            byte level = reader.ReadByte();
+            byte typeFlags = reader.ReadByte();
+            uint typeStrOffset = reader.ReadUInt32LittleEndian();
+            uint nameStrOffset = reader.ReadUInt32LittleEndian();
+            int byteSize = reader.ReadInt32LittleEndian();
+            int index = reader.ReadInt32LittleEndian();
+            uint metaFlag = reader.ReadUInt32LittleEndian();
+            ulong refTypeHash = reader.ReadUInt64LittleEndian();
+
+            nodes[i] = new TypeTreeNode
+            {
+                Version = version,
+                Level = level,
+                TypeFlags = typeFlags,
+                TypeStrOffset = typeStrOffset,
+                NameStrOffset = nameStrOffset,
+                ByteSize = byteSize,
+                Index = index,
+                MetaFlag = metaFlag,
+                RefTypeHash = refTypeHash,
+                HasBuiltInTypeName = (typeStrOffset & 0x80000000u) != 0,
+                HasBuiltInName = (nameStrOffset & 0x80000000u) != 0,
+            };
+        }
+
+        ReadOnlySpan<byte> stringBuffer = reader.ReadBytes(stringBufferSize);
+        Dictionary<uint, string> customStrings = ParseStringBuffer(stringBuffer);
+
+        for (int i = 0; i < nodes.Length; i++)
+        {
+            TypeTreeNode node = nodes[i];
+            nodes[i] = new TypeTreeNode
+            {
+                Version = node.Version,
+                Level = node.Level,
+                TypeFlags = node.TypeFlags,
+                TypeStrOffset = node.TypeStrOffset,
+                NameStrOffset = node.NameStrOffset,
+                ByteSize = node.ByteSize,
+                Index = node.Index,
+                MetaFlag = node.MetaFlag,
+                RefTypeHash = node.RefTypeHash,
+                HasBuiltInTypeName = node.HasBuiltInTypeName,
+                HasBuiltInName = node.HasBuiltInName,
+                TypeName = node.HasBuiltInTypeName ? string.Empty : (customStrings.TryGetValue(node.TypeStrOffset, out string? typeName) ? typeName : string.Empty),
+                Name = node.HasBuiltInName ? string.Empty : (customStrings.TryGetValue(node.NameStrOffset, out string? nodeName) ? nodeName : string.Empty),
+            };
+        }
+
+        return new TypeTreeInfo
+        {
+            Nodes = nodes,
+            CustomStrings = customStrings,
+        };
+    }
+
+    private static Dictionary<uint, string> ParseStringBuffer(ReadOnlySpan<byte> buffer)
+    {
+        Dictionary<uint, string> strings = [];
+        int position = 0;
+        while (position < buffer.Length)
+        {
+            uint offset = (uint)position;
+            int start = position;
+            while (position < buffer.Length && buffer[position] != 0)
+            {
+                position++;
+            }
+
+            if (position >= buffer.Length)
+            {
+                throw new InvalidDataException("Type tree string buffer is not null-terminated.");
+            }
+
+            strings[offset] = Encoding.UTF8.GetString(buffer[start..position]);
+            position++;
+        }
+
+        return strings;
     }
 
     private static int ReadInt32BigEndian(Stream stream)
@@ -348,6 +465,13 @@ public static class SerializedFileParser
             return value;
         }
 
+        internal ushort ReadUInt16LittleEndian()
+        {
+            const int size = sizeof(ushort);
+            ushort value = BinaryPrimitives.ReadUInt16LittleEndian(ReadBytes(size));
+            return value;
+        }
+
         internal short ReadInt16LittleEndian()
         {
             const int size = sizeof(short);
@@ -369,6 +493,13 @@ public static class SerializedFileParser
             return value;
         }
 
+        internal ulong ReadUInt64LittleEndian()
+        {
+            const int size = sizeof(ulong);
+            ulong value = BinaryPrimitives.ReadUInt64LittleEndian(ReadBytes(size));
+            return value;
+        }
+
         internal long ReadInt64LittleEndian()
         {
             const int size = sizeof(long);
@@ -377,4 +508,9 @@ public static class SerializedFileParser
         }
     }
 }
+
+
+
+
+
 
