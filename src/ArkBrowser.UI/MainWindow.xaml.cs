@@ -1,7 +1,10 @@
-﻿using System.Collections.ObjectModel;
+using System.Collections.ObjectModel;
 using System.IO;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using ArkBrowser.Core.Decryption;
 using ArkBrowser.Core.Serialization;
 using Microsoft.Win32;
@@ -13,6 +16,8 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<EntryRow> entries = [];
     private readonly ObservableCollection<ObjectRow> objects = [];
 
+    private readonly Dictionary<string, BitmapSource> thumbnailCache = [];
+    private int previewToken;
     private UnityFsReader? reader;
     private Stream? currentEntryStream;
 
@@ -57,6 +62,8 @@ public partial class MainWindow : Window
 
         PathTextBox.Text = path;
         StatusText.Text = string.Empty;
+        DetailTextBox.Text = string.Empty;
+        PreviewImage.Source = null;
 
         entries.Clear();
         for (int i = 0; i < reader.Entries.Count; i++)
@@ -99,6 +106,8 @@ public partial class MainWindow : Window
     {
         ResetCurrentEntry();
         objects.Clear();
+        DetailTextBox.Text = string.Empty;
+        PreviewImage.Source = null;
 
         if (!row.IsSerializedFile)
         {
@@ -124,7 +133,8 @@ public partial class MainWindow : Window
                 objectInfo.ByteSize,
                 objectInfo.SerializedTypeIndex,
                 objectInfo.ScriptTypeIndex,
-                objectInfo.IsStripped));
+                objectInfo.IsStripped,
+                objectInfo));
         }
 
         StatusText.Text =
@@ -132,11 +142,190 @@ public partial class MainWindow : Window
         UpdateFooter();
     }
 
+    private void ObjectsGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        DetailTextBox.Text = string.Empty;
+        PreviewImage.Source = null;
+
+        if (ObjectsGrid.SelectedItem is not ObjectRow row)
+        {
+            return;
+        }
+
+        if (reader is null || currentEntryStream is null)
+        {
+            return;
+        }
+
+        if (row.TypeId != 28)
+        {
+            DetailTextBox.Text = $"当前对象 TypeID={row.TypeId}，暂未接入专项解析。";
+            return;
+        }
+
+        try
+        {
+            using Stream objectStream = SerializedFileParser.OpenObject(currentEntryStream, row.Info);
+            Texture2DInfo texture = Texture2DReader.Read(objectStream);
+
+            StringBuilder detail = new();
+            detail.AppendLine($"Name: {texture.Name}");
+            detail.AppendLine($"Width: {texture.Width}");
+            detail.AppendLine($"Height: {texture.Height}");
+            detail.AppendLine($"TextureFormat: {texture.TextureFormat}");
+            detail.AppendLine($"CompleteImageSize: {texture.CompleteImageSize}");
+            detail.AppendLine($"InlineImageSize: {texture.InlineImageSize}");
+
+            if (texture.StreamingInfo is not null)
+            {
+                detail.AppendLine($"StreamingInfo.Offset: {texture.StreamingInfo.Offset}");
+                detail.AppendLine($"StreamingInfo.Size: {texture.StreamingInfo.Size}");
+                detail.AppendLine($"StreamingInfo.Path: {texture.StreamingInfo.Path}");
+
+                using Stream? resourceStream = new BundleResourceResolver(reader).OpenStream(texture.StreamingInfo);
+                if (resourceStream is null)
+                {
+                    detail.AppendLine(".resS: no matching resource entry.");
+                }
+                else
+                {
+                    int headLength = (int)Math.Min(64, resourceStream.Length);
+                    byte[] head = new byte[headLength];
+                    int read = resourceStream.Read(head, 0, headLength);
+                    detail.AppendLine($".resS slice length: {resourceStream.Length}");
+                    detail.AppendLine($".resS head ({read} bytes): {Convert.ToHexString(head, 0, read)}");
+                }
+            }
+            else
+            {
+                detail.AppendLine("StreamingInfo: (null / inline)");
+            }
+
+            DetailTextBox.Text = detail.ToString();
+            LoadPreviewAsync(row, texture);
+        }
+        catch (Exception exception)
+        {
+            DetailTextBox.Text = $"解析 Texture2D 失败：{exception.Message}";
+        }
+    }
+
+    private async void LoadPreviewAsync(ObjectRow row, Texture2DInfo texture)
+    {
+        string key = $"{row.Info.PathId}:{row.Info.ByteStart}";
+        if (thumbnailCache.TryGetValue(key, out BitmapSource? cached))
+        {
+            PreviewImage.Source = cached;
+            return;
+        }
+
+        byte[]? compressed;
+        try
+        {
+            compressed = ReadPixelData(row, texture);
+        }
+        catch
+        {
+            return;
+        }
+
+        if (compressed is null)
+        {
+            return;
+        }
+
+        int token = ++previewToken;
+        BitmapSource? bitmap = await Task.Run(() =>
+        {
+            try
+            {
+                byte[] rgba = Texture2DDecoder.DecodeToRgba32(texture, compressed);
+                return CreateBitmapSource(rgba, texture.Width, texture.Height);
+            }
+            catch
+            {
+                return null;
+            }
+        });
+
+        if (token != previewToken)
+        {
+            return;
+        }
+
+        if (bitmap is not null)
+        {
+            thumbnailCache[key] = bitmap;
+            PreviewImage.Source = bitmap;
+        }
+    }
+
+    private byte[]? ReadPixelData(ObjectRow row, Texture2DInfo texture)
+    {
+        if (texture.StreamingInfo is not null && texture.StreamingInfo.IsSet)
+        {
+            using Stream? resourceStream = new BundleResourceResolver(reader!).OpenStream(texture.StreamingInfo);
+            if (resourceStream is null)
+            {
+                return null;
+            }
+
+            byte[] compressed = new byte[checked((int)texture.StreamingInfo.Size)];
+            resourceStream.ReadExactly(compressed);
+            return compressed;
+        }
+
+        if (texture.InlineImageSize > 0)
+        {
+            using Stream objectStream = SerializedFileParser.OpenObject(currentEntryStream!, row.Info);
+            byte[] compressed = new byte[texture.InlineImageSize];
+            objectStream.Position = texture.InlineImageOffset;
+            objectStream.ReadExactly(compressed);
+            return compressed;
+        }
+
+        return null;
+    }
+    private static BitmapSource? CreateBitmapSource(byte[] rgba, int width, int height)
+    {
+        if (width <= 0 || height <= 0)
+        {
+            return null;
+        }
+
+        int stride = checked(width * 4);
+        if (rgba.Length < stride * height)
+        {
+            return null;
+        }
+
+        byte[] bgra = new byte[stride * height];
+        for (int i = 0; i < rgba.Length; i += 4)
+        {
+            bgra[i] = rgba[i + 2];
+            bgra[i + 1] = rgba[i + 1];
+            bgra[i + 2] = rgba[i];
+            bgra[i + 3] = rgba[i + 3];
+        }
+
+        byte[] flipped = new byte[bgra.Length];
+        for (int y = 0; y < height; y++)
+        {
+            Array.Copy(bgra, y * stride, flipped, (height - 1 - y) * stride, stride);
+        }
+
+        BitmapSource bitmap = BitmapSource.Create(width, height, 96, 96, PixelFormats.Bgra32, null, flipped, stride);
+        bitmap.Freeze();
+        return bitmap;
+    }
+
     private void ResetEntrySelection()
     {
         EntriesGrid.SelectedItem = null;
         ResetCurrentEntry();
         objects.Clear();
+        DetailTextBox.Text = string.Empty;
+        PreviewImage.Source = null;
     }
 
     private void ResetCurrentEntry()
@@ -149,6 +338,8 @@ public partial class MainWindow : Window
     {
         ResetCurrentEntry();
         objects.Clear();
+        DetailTextBox.Text = string.Empty;
+        PreviewImage.Source = null;
         StatusText.Text = string.Empty;
         UpdateFooter();
     }
@@ -198,7 +389,8 @@ public sealed class ObjectRow
         int byteSize,
         int serializedTypeIndex,
         short scriptTypeIndex,
-        bool isStripped)
+        bool isStripped,
+        SerializedObjectInfo info)
     {
         PathId = pathId;
         TypeId = typeId;
@@ -207,6 +399,7 @@ public sealed class ObjectRow
         SerializedTypeIndex = serializedTypeIndex;
         ScriptTypeIndex = scriptTypeIndex;
         IsStripped = isStripped;
+        Info = info;
     }
 
     public long PathId { get; }
@@ -216,4 +409,6 @@ public sealed class ObjectRow
     public int SerializedTypeIndex { get; }
     public short ScriptTypeIndex { get; }
     public bool IsStripped { get; }
+    [System.ComponentModel.Browsable(false)]
+    public SerializedObjectInfo Info { get; }
 }
