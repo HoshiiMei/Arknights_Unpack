@@ -20,6 +20,11 @@
                     Content="打开 AB..."
                     Padding="12,6"
                     Click="OpenButton_Click"/>
+            <Button x:Name="ExportButton"
+                    Content="导出选中..."
+                    Padding="12,6"
+                    Margin="10,0,0,0"
+                    Click="ExportButton_Click"/>
             <TextBox x:Name="PathTextBox"
                      Margin="10,0,0,0"
                      IsReadOnly="True"

@@ -263,6 +263,97 @@ public partial class MainWindow : Window
         LoadFullResAsync();
     }
 
+    private async void ExportButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (currentObjectRow is null || currentTexture is null || reader is null || currentEntryStream is null)
+        {
+            MessageBox.Show(this, "请先在 Objects 列表中选择一个资源。", "导出", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        ObjectRow row = currentObjectRow;
+        Texture2DInfo texture = currentTexture;
+
+        if (row.TypeId != 28)
+        {
+            MessageBox.Show(
+                this,
+                $"当前 TypeID={row.TypeId} 暂不支持导出。当前 P5 先完成 Texture2D → PNG，音频 WAV 后续接入解码器。",
+                "导出",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        string safeName = MakeSafeFileName(texture.Name, "texture");
+        SaveFileDialog dialog = new()
+        {
+            Title = "导出 PNG",
+            Filter = "PNG 图片 (*.png)|*.png",
+            FileName = $"{safeName}.png",
+        };
+
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        byte[]? compressed;
+        try
+        {
+            compressed = ReadPixelData(reader, currentEntryStream, row, texture);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, $"读取像素数据失败：{exception.Message}", "导出失败", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        if (compressed is null)
+        {
+            MessageBox.Show(this, "该纹理没有可导出的像素数据。", "导出", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        string targetPath = dialog.FileName;
+        StatusText.Text = "正在导出 PNG...";
+        try
+        {
+            await Task.Run(() =>
+            {
+                byte[] rgba = Texture2DDecoder.DecodeToRgba32(texture, compressed);
+                BitmapSource? bitmap = CreateBitmapSource(rgba, texture.Width, texture.Height);
+                if (bitmap is null)
+                {
+                    throw new InvalidOperationException("无法生成位图。");
+                }
+
+                PngBitmapEncoder encoder = new();
+                encoder.Frames.Add(BitmapFrame.Create(bitmap));
+                using FileStream output = File.Create(targetPath);
+                encoder.Save(output);
+            });
+
+            StatusText.Text = $"已导出：{targetPath}";
+        }
+        catch (Exception exception)
+        {
+            StatusText.Text = string.Empty;
+            MessageBox.Show(this, $"导出失败：{exception.Message}", "导出失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private static string MakeSafeFileName(string name, string fallback)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return fallback;
+        }
+
+        string sanitized = string.Concat(name.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+        return string.IsNullOrWhiteSpace(sanitized) ? fallback : sanitized;
+    }
+
     private void ShowThumbnail(ObjectRow row)
     {
         string key = MakeThumbnailKey(row);
