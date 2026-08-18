@@ -26,10 +26,20 @@
                      VerticalContentAlignment="Center"/>
         </DockPanel>
 
-        <TextBlock x:Name="StatusText"
-                   Grid.Row="1"
-                   Margin="0,10,0,10"
-                   TextWrapping="Wrap"/>
+        <StackPanel Grid.Row="1"
+                    Margin="0,10,0,10">
+            <TextBlock x:Name="StatusText"
+                       TextWrapping="Wrap"/>
+            <ProgressBar x:Name="ThumbnailProgress"
+                         Height="16"
+                         Margin="0,6,0,0"
+                         Minimum="0"
+                         Maximum="1"
+                         Visibility="Collapsed"/>
+            <TextBlock x:Name="ThumbnailStatusText"
+                       Margin="0,4,0,0"
+                       TextWrapping="Wrap"/>
+        </StackPanel>
 
         <Grid Grid.Row="2">
             <Grid.ColumnDefinitions>
@@ -75,9 +85,18 @@
                         Margin="10,0,0,0"
                         BorderBrush="LightGray"
                         BorderThickness="1"
-                        Background="WhiteSmoke"
                         Width="180"
                         Height="180">
+                    <Border.Background>
+                        <DrawingBrush TileMode="Tile" Viewport="0,0,16,16" ViewportUnits="Absolute">
+                            <DrawingBrush.Drawing>
+                                <DrawingGroup>
+                                    <GeometryDrawing Brush="#F5F5F5" Geometry="M0,0 H16 V16 H0 Z"/>
+                                    <GeometryDrawing Brush="#D0D0D0" Geometry="M0,0 H8 V8 H0 Z M8,8 H16 V16 H8 Z"/>
+                                </DrawingGroup>
+                            </DrawingBrush.Drawing>
+                        </DrawingBrush>
+                    </Border.Background>
                     <Image x:Name="PreviewImage"
                            Stretch="Uniform"/>
                 </Border>

@@ -16,7 +16,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<EntryRow> entries = [];
     private readonly ObservableCollection<ObjectRow> objects = [];
 
-    private readonly Dictionary<string, BitmapSource> thumbnailCache = [];
+    private readonly ThumbnailService thumbnails = new();
     private int previewToken;
     private UnityFsReader? reader;
     private Stream? currentEntryStream;
@@ -27,6 +27,7 @@ public partial class MainWindow : Window
 
         EntriesGrid.ItemsSource = entries;
         ObjectsGrid.ItemsSource = objects;
+        thumbnails.ProgressChanged += (done, total) => Dispatcher.BeginInvoke(() => UpdateThumbnailProgress(done, total));
 
         UpdateFooter();
     }
@@ -57,6 +58,7 @@ public partial class MainWindow : Window
     private void OpenBundle(string path)
     {
         ResetEntrySelection();
+        thumbnails.Clear();
         reader?.Dispose();
         reader = UnityFsReader.Open(path);
 
@@ -64,6 +66,7 @@ public partial class MainWindow : Window
         StatusText.Text = string.Empty;
         DetailTextBox.Text = string.Empty;
         PreviewImage.Source = null;
+        ResetThumbnailProgress();
 
         entries.Clear();
         for (int i = 0; i < reader.Entries.Count; i++)
@@ -136,6 +139,27 @@ public partial class MainWindow : Window
                 objectInfo.IsStripped,
                 objectInfo));
         }
+
+        ObjectRow? firstTexture = objects.FirstOrDefault(o => o.TypeId == 28);
+        ObjectsGrid.SelectedItem = firstTexture;
+
+        int entryIndex = row.Index;
+        UnityFsReader capturedReader = reader;
+        List<ThumbnailRequest> thumbnailRequests = [];
+        foreach (ObjectRow objectRow in objects)
+        {
+            if (objectRow.TypeId != 28)
+            {
+                continue;
+            }
+
+            ObjectRow capturedRow = objectRow;
+            thumbnailRequests.Add(new ThumbnailRequest(
+                MakeThumbnailKey(capturedRow),
+                () => LoadThumbnailInput(capturedReader, entryIndex, capturedRow)));
+        }
+
+        thumbnails.Enqueue(thumbnailRequests);
 
         StatusText.Text =
             $"{row.Path}  Types={serializedFile.Types.Count}  Objects={serializedFile.Objects.Count}  DataOffset={serializedFile.Header.DataOffset}";
@@ -212,8 +236,8 @@ public partial class MainWindow : Window
 
     private async void LoadPreviewAsync(ObjectRow row, Texture2DInfo texture)
     {
-        string key = $"{row.Info.PathId}:{row.Info.ByteStart}";
-        if (thumbnailCache.TryGetValue(key, out BitmapSource? cached))
+        string key = MakeThumbnailKey(row);
+        if (thumbnails.TryGet(key, out BitmapSource? cached))
         {
             PreviewImage.Source = cached;
             return;
@@ -222,7 +246,7 @@ public partial class MainWindow : Window
         byte[]? compressed;
         try
         {
-            compressed = ReadPixelData(row, texture);
+            compressed = ReadPixelData(reader!, currentEntryStream!, row, texture);
         }
         catch
         {
@@ -255,16 +279,15 @@ public partial class MainWindow : Window
 
         if (bitmap is not null)
         {
-            thumbnailCache[key] = bitmap;
             PreviewImage.Source = bitmap;
         }
     }
 
-    private byte[]? ReadPixelData(ObjectRow row, Texture2DInfo texture)
+    private static byte[]? ReadPixelData(UnityFsReader reader, Stream entryStream, ObjectRow row, Texture2DInfo texture)
     {
         if (texture.StreamingInfo is not null && texture.StreamingInfo.IsSet)
         {
-            using Stream? resourceStream = new BundleResourceResolver(reader!).OpenStream(texture.StreamingInfo);
+            using Stream? resourceStream = new BundleResourceResolver(reader).OpenStream(texture.StreamingInfo);
             if (resourceStream is null)
             {
                 return null;
@@ -277,7 +300,7 @@ public partial class MainWindow : Window
 
         if (texture.InlineImageSize > 0)
         {
-            using Stream objectStream = SerializedFileParser.OpenObject(currentEntryStream!, row.Info);
+            using Stream objectStream = SerializedFileParser.OpenObject(entryStream, row.Info);
             byte[] compressed = new byte[texture.InlineImageSize];
             objectStream.Position = texture.InlineImageOffset;
             objectStream.ReadExactly(compressed);
@@ -286,7 +309,28 @@ public partial class MainWindow : Window
 
         return null;
     }
-    private static BitmapSource? CreateBitmapSource(byte[] rgba, int width, int height)
+
+    private static ThumbnailJobInput? LoadThumbnailInput(UnityFsReader reader, int entryIndex, ObjectRow row)
+    {
+        try
+        {
+            using Stream entryStream = reader.OpenEntry(entryIndex);
+            using Stream objectStream = SerializedFileParser.OpenObject(entryStream, row.Info);
+            Texture2DInfo texture = Texture2DReader.Read(objectStream);
+            byte[]? compressed = ReadPixelData(reader, entryStream, row, texture);
+            return compressed is null ? null : new ThumbnailJobInput(texture, compressed);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string MakeThumbnailKey(ObjectRow row)
+    {
+        return $"{row.Info.PathId}:{row.Info.ByteStart}";
+    }
+    internal static BitmapSource? CreateBitmapSource(byte[] rgba, int width, int height)
     {
         if (width <= 0 || height <= 0)
         {
@@ -317,6 +361,24 @@ public partial class MainWindow : Window
         BitmapSource bitmap = BitmapSource.Create(width, height, 96, 96, PixelFormats.Bgra32, null, flipped, stride);
         bitmap.Freeze();
         return bitmap;
+    }
+
+    private void UpdateThumbnailProgress(int done, int total)
+    {
+        ThumbnailProgress.Maximum = Math.Max(1, total);
+        ThumbnailProgress.Value = done;
+        ThumbnailProgress.Visibility = total > 0 && done < total ? Visibility.Visible : Visibility.Collapsed;
+        ThumbnailStatusText.Text = total > 0 && done < total
+            ? $"正在生成缩略图 {done}/{total}"
+            : string.Empty;
+    }
+
+    private void ResetThumbnailProgress()
+    {
+        ThumbnailProgress.Maximum = 1;
+        ThumbnailProgress.Value = 0;
+        ThumbnailProgress.Visibility = Visibility.Collapsed;
+        ThumbnailStatusText.Text = string.Empty;
     }
 
     private void ResetEntrySelection()
@@ -354,6 +416,7 @@ public partial class MainWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         ResetCurrentEntry();
+        thumbnails.Dispose();
         reader?.Dispose();
         reader = null;
         base.OnClosed(e);

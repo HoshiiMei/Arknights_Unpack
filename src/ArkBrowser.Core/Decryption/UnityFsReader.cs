@@ -27,6 +27,7 @@ public sealed class UnityFsReader : IDisposable
 	private readonly bool leaveOpen;
 	private readonly StorageBlock[] blocks;
 	private readonly UnityFsEntry[] entries;
+	private readonly object readGate = new();
 	private bool disposed;
 
 	public UnityFsHeader Header { get; }
@@ -70,13 +71,13 @@ public sealed class UnityFsReader : IDisposable
 		}
 
 		UnityFsEntry entry = entries[index];
-		return new SliceStream(new BlockVirtualStream(stream, blocks, Header.DataStart), entry.Offset, entry.Size, leaveOpen: false);
+		return new SliceStream(new BlockVirtualStream(stream, blocks, Header.DataStart, readGate), entry.Offset, entry.Size, leaveOpen: false);
 	}
 
 	public Stream OpenAllData()
 	{
 		ObjectDisposedException.ThrowIf(disposed, this);
-		return new BlockVirtualStream(stream, blocks, Header.DataStart);
+		return new BlockVirtualStream(stream, blocks, Header.DataStart, readGate);
 	}
 
 	internal static Stream CreateReadOnlySlice(Stream parent, long origin, long length, bool leaveOpen = true)
@@ -417,6 +418,7 @@ public sealed class UnityFsReader : IDisposable
 	{
 		private readonly Stream baseStream;
 		private readonly StorageBlock[] blocks;
+		private readonly object readGate;
 		private readonly long[] blockStarts;
 		private readonly long[] compressedStarts;
 		private byte[]? cachedBuffer;
@@ -425,10 +427,11 @@ public sealed class UnityFsReader : IDisposable
 		private long position;
 		private bool disposed;
 
-		public BlockVirtualStream(Stream baseStream, StorageBlock[] blocks, long dataStart)
+		public BlockVirtualStream(Stream baseStream, StorageBlock[] blocks, long dataStart, object readGate)
 		{
 			this.baseStream = baseStream;
 			this.blocks = blocks;
+			this.readGate = readGate;
 
 			blockStarts = new long[blocks.Length];
 			compressedStarts = new long[blocks.Length];
@@ -572,7 +575,6 @@ public sealed class UnityFsReader : IDisposable
 			int compressionType = block.Flags & 0x3F;
 
 			byte[] outputBuffer = ArrayPool<byte>.Shared.Rent(Math.Max(uncompressedSize, 1));
-			baseStream.Position = compressedStarts[blockIndex];
 
 			if (compressionType == 0)
 			{
@@ -582,14 +584,23 @@ public sealed class UnityFsReader : IDisposable
 					throw new InvalidDataException("Uncompressed block size does not match the expected size.");
 				}
 
-				baseStream.ReadExactly(outputBuffer, 0, uncompressedSize);
+				lock (readGate)
+				{
+					baseStream.Position = compressedStarts[blockIndex];
+					baseStream.ReadExactly(outputBuffer, 0, uncompressedSize);
+				}
 			}
 			else
 			{
 				byte[] compressedBuffer = ArrayPool<byte>.Shared.Rent(Math.Max(compressedSize, 1));
 				try
 				{
-					baseStream.ReadExactly(compressedBuffer, 0, compressedSize);
+					lock (readGate)
+					{
+						baseStream.Position = compressedStarts[blockIndex];
+						baseStream.ReadExactly(compressedBuffer, 0, compressedSize);
+					}
+
 					ArkLz4Decryptor.DecompressBlockInPlace(
 						compressedBuffer.AsSpan(0, compressedSize),
 						outputBuffer.AsSpan(0, uncompressedSize),

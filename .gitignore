@@ -28,3 +28,4 @@ packages/
 # Local scratch
 .inspect/
 *.tmp
+.tmp-*/
