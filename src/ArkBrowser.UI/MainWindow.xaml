@@ -62,7 +62,8 @@
                           AutoGenerateColumns="True"
                           IsReadOnly="True"
                           SelectionMode="Single"
-                          SelectionChanged="ObjectsGrid_SelectionChanged"/>
+                          SelectionChanged="ObjectsGrid_SelectionChanged"
+                          MouseDoubleClick="ObjectsGrid_MouseDoubleClick"/>
             </GroupBox>
         </Grid>
 
@@ -97,8 +98,20 @@
                             </DrawingBrush.Drawing>
                         </DrawingBrush>
                     </Border.Background>
-                    <Image x:Name="PreviewImage"
-                           Stretch="Uniform"/>
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <Image x:Name="PreviewImage"
+                               Grid.Row="0"
+                               Stretch="Uniform"/>
+                        <Button x:Name="FullResButton"
+                                Grid.Row="1"
+                                Content="查看原图"
+                                Margin="0,6,0,0"
+                                Click="FullResButton_Click"/>
+                    </Grid>
                 </Border>
             </Grid>
         </GroupBox>

@@ -3,6 +3,7 @@ using System.IO;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using ArkBrowser.Core.Decryption;
@@ -17,9 +18,14 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<ObjectRow> objects = [];
 
     private readonly ThumbnailService thumbnails = new();
+    private readonly FullResCache fullResCache = new(capacity: 3);
     private int previewToken;
     private UnityFsReader? reader;
     private Stream? currentEntryStream;
+    private ObjectRow? currentObjectRow;
+    private Texture2DInfo? currentTexture;
+    private string? currentObjectKey;
+    private bool showingFullRes;
 
     public MainWindow()
     {
@@ -28,6 +34,7 @@ public partial class MainWindow : Window
         EntriesGrid.ItemsSource = entries;
         ObjectsGrid.ItemsSource = objects;
         thumbnails.ProgressChanged += (done, total) => Dispatcher.BeginInvoke(() => UpdateThumbnailProgress(done, total));
+        thumbnails.ThumbnailReady += (key, thumbnail) => Dispatcher.BeginInvoke(() => OnThumbnailReady(key, thumbnail));
 
         UpdateFooter();
     }
@@ -59,6 +66,7 @@ public partial class MainWindow : Window
     {
         ResetEntrySelection();
         thumbnails.Clear();
+        fullResCache.Clear();
         reader?.Dispose();
         reader = UnityFsReader.Open(path);
 
@@ -170,6 +178,10 @@ public partial class MainWindow : Window
     {
         DetailTextBox.Text = string.Empty;
         PreviewImage.Source = null;
+        currentObjectRow = null;
+        currentTexture = null;
+        currentObjectKey = null;
+        showingFullRes = false;
 
         if (ObjectsGrid.SelectedItem is not ObjectRow row)
         {
@@ -191,6 +203,10 @@ public partial class MainWindow : Window
         {
             using Stream objectStream = SerializedFileParser.OpenObject(currentEntryStream, row.Info);
             Texture2DInfo texture = Texture2DReader.Read(objectStream);
+            currentObjectRow = row;
+            currentTexture = texture;
+            currentObjectKey = MakeThumbnailKey(row);
+            showingFullRes = false;
 
             StringBuilder detail = new();
             detail.AppendLine($"Name: {texture.Name}");
@@ -226,7 +242,7 @@ public partial class MainWindow : Window
             }
 
             DetailTextBox.Text = detail.ToString();
-            LoadPreviewAsync(row, texture);
+            ShowThumbnail(row);
         }
         catch (Exception exception)
         {
@@ -234,11 +250,54 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void LoadPreviewAsync(ObjectRow row, Texture2DInfo texture)
+    private void ObjectsGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (ObjectsGrid.SelectedItem is ObjectRow { TypeId: 28 })
+        {
+            LoadFullResAsync();
+        }
+    }
+
+    private void FullResButton_Click(object sender, RoutedEventArgs e)
+    {
+        LoadFullResAsync();
+    }
+
+    private void ShowThumbnail(ObjectRow row)
     {
         string key = MakeThumbnailKey(row);
-        if (thumbnails.TryGet(key, out BitmapSource? cached))
+        if (thumbnails.TryGet(key, out BitmapSource? thumbnail))
         {
+            PreviewImage.Source = thumbnail;
+            return;
+        }
+
+        PreviewImage.Source = null;
+    }
+
+    private void OnThumbnailReady(string key, BitmapSource thumbnail)
+    {
+        if (showingFullRes || currentObjectKey != key)
+        {
+            return;
+        }
+
+        PreviewImage.Source = thumbnail;
+    }
+
+    private async void LoadFullResAsync()
+    {
+        if (currentObjectRow is null || currentTexture is null || reader is null || currentEntryStream is null)
+        {
+            return;
+        }
+
+        ObjectRow row = currentObjectRow;
+        Texture2DInfo texture = currentTexture;
+        string key = MakeThumbnailKey(row);
+        if (fullResCache.TryGet(key, out BitmapSource? cached))
+        {
+            showingFullRes = true;
             PreviewImage.Source = cached;
             return;
         }
@@ -246,10 +305,11 @@ public partial class MainWindow : Window
         byte[]? compressed;
         try
         {
-            compressed = ReadPixelData(reader!, currentEntryStream!, row, texture);
+            compressed = ReadPixelData(reader, currentEntryStream, row, texture);
         }
-        catch
+        catch (Exception exception)
         {
+            DetailTextBox.Text = $"读取像素数据失败：{exception.Message}";
             return;
         }
 
@@ -259,6 +319,7 @@ public partial class MainWindow : Window
         }
 
         int token = ++previewToken;
+        StatusText.Text = "正在加载原图...";
         BitmapSource? bitmap = await Task.Run(() =>
         {
             try
@@ -279,7 +340,10 @@ public partial class MainWindow : Window
 
         if (bitmap is not null)
         {
+            fullResCache.Add(key, bitmap);
+            showingFullRes = true;
             PreviewImage.Source = bitmap;
+            StatusText.Text = $"原图 {texture.Width}x{texture.Height}";
         }
     }
 
@@ -394,6 +458,10 @@ public partial class MainWindow : Window
     {
         currentEntryStream?.Dispose();
         currentEntryStream = null;
+        currentObjectRow = null;
+        currentTexture = null;
+        currentObjectKey = null;
+        showingFullRes = false;
     }
 
     private void ClearObjects()

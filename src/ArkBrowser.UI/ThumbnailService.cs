@@ -19,6 +19,7 @@ internal sealed class ThumbnailService : IDisposable
     private bool disposed;
 
     public event Action<int, int>? ProgressChanged;
+    public event Action<string, BitmapSource>? ThumbnailReady;
 
     public bool TryGet(string key, out BitmapSource? thumbnail)
     {
@@ -129,6 +130,7 @@ internal sealed class ThumbnailService : IDisposable
                 if (thumbnail is not null)
                 {
                     cache[request.Key] = thumbnail;
+                    ThumbnailReady?.Invoke(request.Key, thumbnail);
                 }
 
                 int done = Interlocked.Increment(ref completed);
