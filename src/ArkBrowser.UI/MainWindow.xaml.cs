@@ -14,8 +14,8 @@ namespace ArkBrowser.UI;
 
 public partial class MainWindow : Window
 {
-    private readonly ObservableCollection<EntryRow> entries = [];
     private readonly ObservableCollection<ObjectRow> objects = [];
+    private readonly List<LoadedBundle> bundles = [];
 
     private readonly ThumbnailService thumbnails = new();
     private readonly FullResCache fullResCache = new(capacity: 3);
@@ -25,13 +25,14 @@ public partial class MainWindow : Window
     private ObjectRow? currentObjectRow;
     private Texture2DInfo? currentTexture;
     private string? currentObjectKey;
+    private string? currentBundleKey;
+    private int currentEntryIndex;
     private bool showingFullRes;
 
     public MainWindow()
     {
         InitializeComponent();
 
-        EntriesGrid.ItemsSource = entries;
         ObjectsGrid.ItemsSource = objects;
         thumbnails.ProgressChanged += (done, total) => Dispatcher.BeginInvoke(() => UpdateThumbnailProgress(done, total));
         thumbnails.ThumbnailReady += (key, thumbnail) => Dispatcher.BeginInvoke(() => OnThumbnailReady(key, thumbnail));
@@ -62,40 +63,155 @@ public partial class MainWindow : Window
         }
     }
 
+    private async void OpenDirectoryButton_Click(object sender, RoutedEventArgs e)
+    {
+        OpenFolderDialog dialog = new()
+        {
+            Title = "选择 Arknights AB 目录",
+        };
+
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        try
+        {
+            OpenButton.IsEnabled = false;
+            OpenDirectoryButton.IsEnabled = false;
+            StatusText.Text = "正在扫描目录...";
+            string rootPath = dialog.FolderName;
+            List<LoadedBundle> loaded = await Task.Run(() => LoadBundlesFromDirectory(rootPath));
+            ApplyLoadedBundles(rootPath, loaded);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, exception.ToString(), "打开目录失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            OpenButton.IsEnabled = true;
+            OpenDirectoryButton.IsEnabled = true;
+        }
+    }
+
     private void OpenBundle(string path)
     {
-        ResetEntrySelection();
-        thumbnails.Clear();
-        fullResCache.Clear();
-        reader?.Dispose();
-        reader = UnityFsReader.Open(path);
+        string rootPath = Path.GetDirectoryName(path) ?? path;
+        List<LoadedBundle> loaded =
+        [
+            new LoadedBundle
+            {
+                FilePath = path,
+                RelativePath = Path.GetFileName(path),
+                Reader = UnityFsReader.Open(path),
+            },
+        ];
 
-        PathTextBox.Text = path;
+        ApplyLoadedBundles(rootPath, loaded);
+    }
+
+    private static List<LoadedBundle> LoadBundlesFromDirectory(string rootPath)
+    {
+        List<LoadedBundle> loaded = [];
+        foreach (string file in Directory.EnumerateFiles(rootPath, "*.ab", SearchOption.AllDirectories))
+        {
+            try
+            {
+                loaded.Add(new LoadedBundle
+                {
+                    FilePath = file,
+                    RelativePath = Path.GetRelativePath(rootPath, file),
+                    Reader = UnityFsReader.Open(file),
+                });
+            }
+            catch
+            {
+            }
+        }
+
+        loaded.Sort((left, right) => string.Compare(left.RelativePath, right.RelativePath, StringComparison.OrdinalIgnoreCase));
+        return loaded;
+    }
+
+    private void ApplyLoadedBundles(string rootPath, IReadOnlyList<LoadedBundle> loaded)
+    {
+        ClearAllBundles();
+        bundles.AddRange(loaded);
+
+        PathTextBox.Text = rootPath;
         StatusText.Text = string.Empty;
         DetailTextBox.Text = string.Empty;
         PreviewImage.Source = null;
         ResetThumbnailProgress();
+        BuildAssetTree(rootPath, loaded);
 
-        entries.Clear();
-        for (int i = 0; i < reader.Entries.Count; i++)
-        {
-            UnityFsEntry entry = reader.Entries[i];
-            entries.Add(new EntryRow(
-                i,
-                entry.Path,
-                entry.Offset,
-                entry.Size,
-                entry.Flags,
-                entry.IsSerializedFile));
-        }
-
-        StatusText.Text = $"已打开 {Path.GetFileName(path)}，Entries={reader.Entries.Count}";
+        StatusText.Text = $"已加载 {loaded.Count} 个 AB";
         UpdateFooter();
     }
 
-    private void EntriesGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    private void ClearAllBundles()
     {
-        if (EntriesGrid.SelectedItem is not EntryRow row)
+        ResetCurrentEntry();
+        foreach (LoadedBundle bundle in bundles)
+        {
+            bundle.Reader.Dispose();
+        }
+
+        bundles.Clear();
+        objects.Clear();
+        thumbnails.Clear();
+        fullResCache.Clear();
+        AssetTree.Items.Clear();
+        reader = null;
+        PreviewImage.Source = null;
+        DetailTextBox.Text = string.Empty;
+        ResetThumbnailProgress();
+    }
+
+    private void BuildAssetTree(string rootPath, IReadOnlyList<LoadedBundle> loaded)
+    {
+        AssetTree.Items.Clear();
+        string rootName = Path.GetFileName(rootPath.TrimEnd(Path.DirectorySeparatorChar));
+        if (string.IsNullOrWhiteSpace(rootName))
+        {
+            rootName = rootPath;
+        }
+
+        TreeViewItem rootItem = new() { Header = rootName };
+        foreach (LoadedBundle bundle in loaded)
+        {
+            rootItem.Items.Add(CreateBundleItem(bundle));
+        }
+
+        AssetTree.Items.Add(rootItem);
+        rootItem.IsExpanded = true;
+    }
+
+    private static TreeViewItem CreateBundleItem(LoadedBundle bundle)
+    {
+        TreeViewItem bundleItem = new()
+        {
+            Header = bundle.RelativePath,
+            Tag = new BundleNode(bundle),
+        };
+
+        for (int i = 0; i < bundle.Reader.Entries.Count; i++)
+        {
+            UnityFsEntry entry = bundle.Reader.Entries[i];
+            bundleItem.Items.Add(new TreeViewItem
+            {
+                Header = entry.Path,
+                Tag = new EntryNode(bundle, i),
+            });
+        }
+
+        return bundleItem;
+    }
+
+    private void AssetTree_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
+    {
+        if (AssetTree.SelectedItem is not TreeViewItem { Tag: EntryNode entryNode })
         {
             ClearObjects();
             return;
@@ -103,7 +219,7 @@ public partial class MainWindow : Window
 
         try
         {
-            LoadEntry(row);
+            LoadEntryNode(entryNode);
         }
         catch (Exception exception)
         {
@@ -113,26 +229,25 @@ public partial class MainWindow : Window
         }
     }
 
-    private void LoadEntry(EntryRow row)
+    private void LoadEntryNode(EntryNode entryNode)
     {
         ResetCurrentEntry();
+        currentBundleKey = entryNode.Bundle.RelativePath;
+        currentEntryIndex = entryNode.EntryIndex;
         objects.Clear();
         DetailTextBox.Text = string.Empty;
         PreviewImage.Source = null;
 
-        if (!row.IsSerializedFile)
+        UnityFsEntry unityEntry = entryNode.Bundle.Reader.Entries[entryNode.EntryIndex];
+        if (!unityEntry.IsSerializedFile)
         {
-            StatusText.Text = $"{row.Path} 是资源流，跳过 SerializedFile 对象表解析。";
+            StatusText.Text = $"{unityEntry.Path} 是资源流，跳过 SerializedFile 对象表解析。";
             UpdateFooter();
             return;
         }
 
-        if (reader is null)
-        {
-            return;
-        }
-
-        currentEntryStream = reader.OpenEntry(row.Index);
+        reader = entryNode.Bundle.Reader;
+        currentEntryStream = reader.OpenEntry(entryNode.EntryIndex);
         SerializedFileInfo serializedFile = SerializedFileParser.Parse(currentEntryStream);
 
         foreach (SerializedObjectInfo objectInfo in serializedFile.Objects)
@@ -151,8 +266,8 @@ public partial class MainWindow : Window
         ObjectRow? firstTexture = objects.FirstOrDefault(o => o.TypeId == 28);
         ObjectsGrid.SelectedItem = firstTexture;
 
-        int entryIndex = row.Index;
-        UnityFsReader capturedReader = reader;
+        int entryIndex = entryNode.EntryIndex;
+        UnityFsReader capturedReader = entryNode.Bundle.Reader;
         List<ThumbnailRequest> thumbnailRequests = [];
         foreach (ObjectRow objectRow in objects)
         {
@@ -170,7 +285,7 @@ public partial class MainWindow : Window
         thumbnails.Enqueue(thumbnailRequests);
 
         StatusText.Text =
-            $"{row.Path}  Types={serializedFile.Types.Count}  Objects={serializedFile.Objects.Count}  DataOffset={serializedFile.Header.DataOffset}";
+            $"{entryNode.Bundle.RelativePath} → {unityEntry.Path}  Types={serializedFile.Types.Count}  Objects={serializedFile.Objects.Count}  DataOffset={serializedFile.Header.DataOffset}";
         UpdateFooter();
     }
 
@@ -481,9 +596,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private static string MakeThumbnailKey(ObjectRow row)
+    private string MakeThumbnailKey(ObjectRow row)
     {
-        return $"{row.Info.PathId}:{row.Info.ByteStart}";
+        return $"{currentBundleKey ?? string.Empty}:{currentEntryIndex}:{row.Info.PathId}:{row.Info.ByteStart}";
     }
     internal static BitmapSource? CreateBitmapSource(byte[] rgba, int width, int height)
     {
@@ -536,15 +651,6 @@ public partial class MainWindow : Window
         ThumbnailStatusText.Text = string.Empty;
     }
 
-    private void ResetEntrySelection()
-    {
-        EntriesGrid.SelectedItem = null;
-        ResetCurrentEntry();
-        objects.Clear();
-        DetailTextBox.Text = string.Empty;
-        PreviewImage.Source = null;
-    }
-
     private void ResetCurrentEntry()
     {
         currentEntryStream?.Dispose();
@@ -567,40 +673,29 @@ public partial class MainWindow : Window
 
     private void UpdateFooter()
     {
-        int entryCount = EntriesGrid.Items.Count;
+        int bundleCount = bundles.Count;
         int objectCount = objects.Count;
-        FooterText.Text = $"Entries={entryCount}  Objects={objectCount}";
+        FooterText.Text = $"Bundles={bundleCount}  Objects={objectCount}";
     }
 
     protected override void OnClosed(EventArgs e)
     {
-        ResetCurrentEntry();
+        ClearAllBundles();
         thumbnails.Dispose();
-        reader?.Dispose();
-        reader = null;
         base.OnClosed(e);
     }
 }
 
-public sealed class EntryRow
+internal sealed class LoadedBundle
 {
-    public EntryRow(int index, string path, long offset, long size, uint flags, bool isSerializedFile)
-    {
-        Index = index;
-        Path = path;
-        Offset = offset;
-        Size = size;
-        Flags = flags;
-        IsSerializedFile = isSerializedFile;
-    }
-
-    public int Index { get; }
-    public string Path { get; }
-    public long Offset { get; }
-    public long Size { get; }
-    public uint Flags { get; }
-    public bool IsSerializedFile { get; }
+    public required string FilePath { get; init; }
+    public required string RelativePath { get; init; }
+    public required UnityFsReader Reader { get; init; }
 }
+
+internal sealed record BundleNode(LoadedBundle Bundle);
+
+internal sealed record EntryNode(LoadedBundle Bundle, int EntryIndex);
 
 public sealed class ObjectRow
 {
