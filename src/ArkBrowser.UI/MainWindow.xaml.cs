@@ -28,6 +28,8 @@ public partial class MainWindow : Window
     private string? currentBundleKey;
     private int currentEntryIndex;
     private bool showingFullRes;
+    private BitmapSource? previewBase;
+    private ChannelView channelView = ChannelView.Rgba;
 
     public MainWindow()
     {
@@ -36,6 +38,7 @@ public partial class MainWindow : Window
         ObjectsGrid.ItemsSource = objects;
         thumbnails.ProgressChanged += (done, total) => Dispatcher.BeginInvoke(() => UpdateThumbnailProgress(done, total));
         thumbnails.ThumbnailReady += (key, thumbnail) => Dispatcher.BeginInvoke(() => OnThumbnailReady(key, thumbnail));
+        ChannelViewCombo.SelectedIndex = 0;
 
         UpdateFooter();
     }
@@ -81,8 +84,8 @@ public partial class MainWindow : Window
             OpenDirectoryButton.IsEnabled = false;
             StatusText.Text = "正在扫描目录...";
             string rootPath = dialog.FolderName;
-            List<LoadedBundle> loaded = await Task.Run(() => LoadBundlesFromDirectory(rootPath));
-            ApplyLoadedBundles(rootPath, loaded);
+            (List<LoadedBundle> loaded, int skipped) = await Task.Run(() => LoadBundlesFromDirectory(rootPath));
+            ApplyLoadedBundles(rootPath, loaded, skipped);
         }
         catch (Exception exception)
         {
@@ -111,11 +114,18 @@ public partial class MainWindow : Window
         ApplyLoadedBundles(rootPath, loaded);
     }
 
-    private static List<LoadedBundle> LoadBundlesFromDirectory(string rootPath)
+    private static (List<LoadedBundle> Loaded, int Skipped) LoadBundlesFromDirectory(string rootPath)
     {
         List<LoadedBundle> loaded = [];
-        foreach (string file in Directory.EnumerateFiles(rootPath, "*.ab", SearchOption.AllDirectories))
+        int skipped = 0;
+        string[] supportedExtensions = [".ab", ".unity3d"];
+        foreach (string file in Directory.EnumerateFiles(rootPath, "*", SearchOption.AllDirectories))
         {
+            if (!supportedExtensions.Contains(Path.GetExtension(file), StringComparer.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             try
             {
                 loaded.Add(new LoadedBundle
@@ -127,14 +137,15 @@ public partial class MainWindow : Window
             }
             catch
             {
+                skipped++;
             }
         }
 
         loaded.Sort((left, right) => string.Compare(left.RelativePath, right.RelativePath, StringComparison.OrdinalIgnoreCase));
-        return loaded;
+        return (loaded, skipped);
     }
 
-    private void ApplyLoadedBundles(string rootPath, IReadOnlyList<LoadedBundle> loaded)
+    private void ApplyLoadedBundles(string rootPath, IReadOnlyList<LoadedBundle> loaded, int skipped = 0)
     {
         ClearAllBundles();
         bundles.AddRange(loaded);
@@ -142,11 +153,13 @@ public partial class MainWindow : Window
         PathTextBox.Text = rootPath;
         StatusText.Text = string.Empty;
         DetailTextBox.Text = string.Empty;
-        PreviewImage.Source = null;
+        SetPreview(null);
         ResetThumbnailProgress();
         BuildAssetTree(rootPath, loaded);
 
-        StatusText.Text = $"已加载 {loaded.Count} 个 AB";
+        StatusText.Text = skipped > 0
+            ? $"已加载 {loaded.Count} 个 AB，跳过 {skipped} 个无效文件"
+            : $"已加载 {loaded.Count} 个 AB";
         UpdateFooter();
     }
 
@@ -164,7 +177,7 @@ public partial class MainWindow : Window
         fullResCache.Clear();
         AssetTree.Items.Clear();
         reader = null;
-        PreviewImage.Source = null;
+        SetPreview(null);
         DetailTextBox.Text = string.Empty;
         ResetThumbnailProgress();
     }
@@ -236,7 +249,7 @@ public partial class MainWindow : Window
         currentEntryIndex = entryNode.EntryIndex;
         objects.Clear();
         DetailTextBox.Text = string.Empty;
-        PreviewImage.Source = null;
+        SetPreview(null);
 
         UnityFsEntry unityEntry = entryNode.Bundle.Reader.Entries[entryNode.EntryIndex];
         if (!unityEntry.IsSerializedFile)
@@ -292,7 +305,7 @@ public partial class MainWindow : Window
     private void ObjectsGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         DetailTextBox.Text = string.Empty;
-        PreviewImage.Source = null;
+        SetPreview(null);
         currentObjectRow = null;
         currentTexture = null;
         currentObjectKey = null;
@@ -305,6 +318,12 @@ public partial class MainWindow : Window
 
         if (reader is null || currentEntryStream is null)
         {
+            return;
+        }
+
+        if (row.TypeId == 83)
+        {
+            DetailTextBox.Text = "AudioClip：音频试听/导出需接入 FMOD/Unity Audio 解码，当前版本暂未支持。";
             return;
         }
 
@@ -380,23 +399,60 @@ public partial class MainWindow : Window
 
     private async void ExportButton_Click(object sender, RoutedEventArgs e)
     {
-        if (currentObjectRow is null || currentTexture is null || reader is null || currentEntryStream is null)
+        if (reader is null || currentEntryStream is null)
         {
             MessageBox.Show(this, "请先在 Objects 列表中选择一个资源。", "导出", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
-        ObjectRow row = currentObjectRow;
-        Texture2DInfo texture = currentTexture;
-
-        if (row.TypeId != 28)
+        List<ObjectRow> selected = ObjectsGrid.SelectedItems.OfType<ObjectRow>().Where(o => o.TypeId == 28).ToList();
+        if (selected.Count == 0)
         {
-            MessageBox.Show(
-                this,
-                $"当前 TypeID={row.TypeId} 暂不支持导出。当前 P5 先完成 Texture2D → PNG，音频 WAV 后续接入解码器。",
-                "导出",
-                MessageBoxButton.OK,
-                MessageBoxImage.Information);
+            MessageBox.Show(this, "请先在 Objects 列表中选择一个 Texture2D。", "导出", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (selected.Count == 1)
+        {
+            await ExportSingleTextureAsync(selected[0]);
+            return;
+        }
+
+        OpenFolderDialog folderDialog = new()
+        {
+            Title = "选择导出目录",
+        };
+
+        if (folderDialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        await ExportTexturesToFolderAsync(selected, folderDialog.FolderName);
+    }
+
+    private async Task ExportSingleTextureAsync(ObjectRow row)
+    {
+        if (reader is null || currentEntryStream is null)
+        {
+            return;
+        }
+
+        byte[]? compressed;
+        Texture2DInfo texture;
+        try
+        {
+            compressed = PrepareTexture(row, out texture);
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show(this, $"读取像素数据失败：{exception.Message}", "导出失败", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        if (compressed is null)
+        {
+            MessageBox.Show(this, "该纹理没有可导出的像素数据。", "导出", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
@@ -413,42 +469,11 @@ public partial class MainWindow : Window
             return;
         }
 
-        byte[]? compressed;
-        try
-        {
-            compressed = ReadPixelData(reader, currentEntryStream, row, texture);
-        }
-        catch (Exception exception)
-        {
-            MessageBox.Show(this, $"读取像素数据失败：{exception.Message}", "导出失败", MessageBoxButton.OK, MessageBoxImage.Error);
-            return;
-        }
-
-        if (compressed is null)
-        {
-            MessageBox.Show(this, "该纹理没有可导出的像素数据。", "导出", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
         string targetPath = dialog.FileName;
         StatusText.Text = "正在导出 PNG...";
         try
         {
-            await Task.Run(() =>
-            {
-                byte[] rgba = Texture2DDecoder.DecodeToRgba32(texture, compressed);
-                BitmapSource? bitmap = CreateBitmapSource(rgba, texture.Width, texture.Height);
-                if (bitmap is null)
-                {
-                    throw new InvalidOperationException("无法生成位图。");
-                }
-
-                PngBitmapEncoder encoder = new();
-                encoder.Frames.Add(BitmapFrame.Create(bitmap));
-                using FileStream output = File.Create(targetPath);
-                encoder.Save(output);
-            });
-
+            await Task.Run(() => SaveTexturePng(texture, compressed, targetPath));
             StatusText.Text = $"已导出：{targetPath}";
         }
         catch (Exception exception)
@@ -456,6 +481,105 @@ public partial class MainWindow : Window
             StatusText.Text = string.Empty;
             MessageBox.Show(this, $"导出失败：{exception.Message}", "导出失败", MessageBoxButton.OK, MessageBoxImage.Error);
         }
+    }
+
+    private async Task ExportTexturesToFolderAsync(IReadOnlyList<ObjectRow> rows, string outputDirectory)
+    {
+        List<(ObjectRow Row, Texture2DInfo Texture, byte[] Compressed)> jobs = [];
+        int readFailures = 0;
+        foreach (ObjectRow row in rows)
+        {
+            try
+            {
+                byte[]? compressed = PrepareTexture(row, out Texture2DInfo texture);
+                if (compressed is null)
+                {
+                    readFailures++;
+                    continue;
+                }
+
+                jobs.Add((row, texture, compressed));
+            }
+            catch
+            {
+                readFailures++;
+            }
+        }
+
+        if (jobs.Count == 0)
+        {
+            MessageBox.Show(this, "没有可导出的纹理。", "导出", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        StatusText.Text = $"正在导出 {jobs.Count} 张 PNG...";
+        int exported = 0;
+        List<string> errors = [];
+        await Task.Run(() =>
+        {
+            foreach ((ObjectRow row, Texture2DInfo texture, byte[] compressed) in jobs)
+            {
+                string fileName = MakeSafeFileName(texture.Name, "texture");
+                string targetPath = BuildUniquePath(outputDirectory, fileName, row.Info.PathId);
+                try
+                {
+                    SaveTexturePng(texture, compressed, targetPath);
+                    Interlocked.Increment(ref exported);
+                }
+                catch (Exception exception)
+                {
+                    lock (errors)
+                    {
+                        errors.Add($"{fileName}: {exception.Message}");
+                    }
+                }
+            }
+        });
+
+        StatusText.Text = $"已导出 {exported}/{jobs.Count} 张 PNG" + (readFailures > 0 ? $"，读取失败 {readFailures}" : string.Empty);
+        if (errors.Count > 0)
+        {
+            MessageBox.Show(this, string.Join(Environment.NewLine, errors.Take(5)), "部分导出失败", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private byte[]? PrepareTexture(ObjectRow row, out Texture2DInfo texture)
+    {
+        if (reader is null || currentEntryStream is null)
+        {
+            texture = null!;
+            return null;
+        }
+
+        using Stream objectStream = SerializedFileParser.OpenObject(currentEntryStream, row.Info);
+        texture = Texture2DReader.Read(objectStream);
+        return ReadPixelData(reader, currentEntryStream, row, texture);
+    }
+
+    private static void SaveTexturePng(Texture2DInfo texture, byte[] compressed, string targetPath)
+    {
+        byte[] rgba = Texture2DDecoder.DecodeToRgba32(texture, compressed);
+        BitmapSource? bitmap = CreateBitmapSource(rgba, texture.Width, texture.Height);
+        if (bitmap is null)
+        {
+            throw new InvalidOperationException("无法生成位图。");
+        }
+
+        PngBitmapEncoder encoder = new();
+        encoder.Frames.Add(BitmapFrame.Create(bitmap));
+        using FileStream output = File.Create(targetPath);
+        encoder.Save(output);
+    }
+
+    private static string BuildUniquePath(string outputDirectory, string fileName, long pathId)
+    {
+        string firstCandidate = Path.Combine(outputDirectory, $"{fileName}.png");
+        if (!File.Exists(firstCandidate))
+        {
+            return firstCandidate;
+        }
+
+        return Path.Combine(outputDirectory, $"{fileName}_{pathId}.png");
     }
 
     private static string MakeSafeFileName(string name, string fallback)
@@ -474,11 +598,11 @@ public partial class MainWindow : Window
         string key = MakeThumbnailKey(row);
         if (thumbnails.TryGet(key, out BitmapSource? thumbnail))
         {
-            PreviewImage.Source = thumbnail;
+            SetPreview(thumbnail);
             return;
         }
 
-        PreviewImage.Source = null;
+        SetPreview(null);
     }
 
     private void OnThumbnailReady(string key, BitmapSource thumbnail)
@@ -488,7 +612,75 @@ public partial class MainWindow : Window
             return;
         }
 
-        PreviewImage.Source = thumbnail;
+        SetPreview(thumbnail);
+    }
+
+    private void ChannelViewCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ChannelViewCombo.SelectedItem is not ComboBoxItem { Tag: string tag })
+        {
+            return;
+        }
+
+        channelView = tag switch
+        {
+            "Rgb" => ChannelView.Rgb,
+            "Alpha" => ChannelView.Alpha,
+            _ => ChannelView.Rgba,
+        };
+
+        ApplyChannelView();
+    }
+
+    private void SetPreview(BitmapSource? source)
+    {
+        previewBase = source;
+        ApplyChannelView();
+    }
+
+    private void ApplyChannelView()
+    {
+        if (previewBase is null)
+        {
+            PreviewImage.Source = null;
+            return;
+        }
+
+        PreviewImage.Source = channelView == ChannelView.Rgba
+            ? previewBase
+            : RenderChannelView(previewBase, channelView);
+    }
+
+    private static BitmapSource RenderChannelView(BitmapSource source, ChannelView view)
+    {
+        int width = source.PixelWidth;
+        int height = source.PixelHeight;
+        int stride = width * 4;
+        byte[] pixels = new byte[stride * height];
+        source.CopyPixels(pixels, stride, 0);
+
+        if (view == ChannelView.Rgb)
+        {
+            for (int i = 3; i < pixels.Length; i += 4)
+            {
+                pixels[i] = 255;
+            }
+        }
+        else if (view == ChannelView.Alpha)
+        {
+            for (int i = 0; i < pixels.Length; i += 4)
+            {
+                byte alpha = pixels[i + 3];
+                pixels[i] = alpha;
+                pixels[i + 1] = alpha;
+                pixels[i + 2] = alpha;
+                pixels[i + 3] = 255;
+            }
+        }
+
+        BitmapSource rendered = BitmapSource.Create(width, height, source.DpiX, source.DpiY, PixelFormats.Bgra32, null, pixels, stride);
+        rendered.Freeze();
+        return rendered;
     }
 
     private async void LoadFullResAsync()
@@ -504,7 +696,7 @@ public partial class MainWindow : Window
         if (fullResCache.TryGet(key, out BitmapSource? cached))
         {
             showingFullRes = true;
-            PreviewImage.Source = cached;
+            SetPreview(cached);
             return;
         }
 
@@ -548,7 +740,7 @@ public partial class MainWindow : Window
         {
             fullResCache.Add(key, bitmap);
             showingFullRes = true;
-            PreviewImage.Source = bitmap;
+            SetPreview(bitmap);
             StatusText.Text = $"原图 {texture.Width}x{texture.Height}";
         }
     }
@@ -666,7 +858,7 @@ public partial class MainWindow : Window
         ResetCurrentEntry();
         objects.Clear();
         DetailTextBox.Text = string.Empty;
-        PreviewImage.Source = null;
+        SetPreview(null);
         StatusText.Text = string.Empty;
         UpdateFooter();
     }
@@ -696,6 +888,13 @@ internal sealed class LoadedBundle
 internal sealed record BundleNode(LoadedBundle Bundle);
 
 internal sealed record EntryNode(LoadedBundle Bundle, int EntryIndex);
+
+internal enum ChannelView
+{
+    Rgba,
+    Rgb,
+    Alpha,
+}
 
 public sealed class ObjectRow
 {

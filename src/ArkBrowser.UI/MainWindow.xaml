@@ -30,6 +30,17 @@
                     Padding="12,6"
                     Margin="10,0,0,0"
                     Click="ExportButton_Click"/>
+            <TextBlock Text="通道:"
+                       VerticalAlignment="Center"
+                       Margin="16,0,0,0"/>
+            <ComboBox x:Name="ChannelViewCombo"
+                      Width="110"
+                      Margin="6,0,0,0"
+                      SelectionChanged="ChannelViewCombo_SelectionChanged">
+                <ComboBoxItem Content="RGB+A" Tag="Rgba"/>
+                <ComboBoxItem Content="RGB" Tag="Rgb"/>
+                <ComboBoxItem Content="Alpha" Tag="Alpha"/>
+            </ComboBox>
             <TextBox x:Name="PathTextBox"
                      Margin="10,0,0,0"
                      IsReadOnly="True"
@@ -68,7 +79,7 @@
                 <DataGrid x:Name="ObjectsGrid"
                           AutoGenerateColumns="True"
                           IsReadOnly="True"
-                          SelectionMode="Single"
+                          SelectionMode="Extended"
                           SelectionChanged="ObjectsGrid_SelectionChanged"
                           MouseDoubleClick="ObjectsGrid_MouseDoubleClick"/>
             </GroupBox>
